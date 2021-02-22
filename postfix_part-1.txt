@@ -16,6 +16,7 @@ It is very important that you make /bin/sh a symlink to /bin/bash...
 dpkg-reconfigure dash
 Use dash as the default system shell (/bin/sh)? <-- No
 
+
 ... and that you disable AppArmor:
 
 /etc/init.d/apparmor stop 
