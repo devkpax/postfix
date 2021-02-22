@@ -1,0 +1,316 @@
+5 Configure o Postfix
+Agora temos que dizer ao Postfix onde ele pode encontrar todas as informações no banco de dados. 
+Portanto, temos que criar seis arquivos de texto. Você notará que digo ao Postfix para se conectar ao MySQL no endereço IP 127.0.0.1 em vez de localhost. 
+Isso ocorre porque o Postfix está rodando em uma jaula chroot e não tem acesso ao socket MySQL, que tentaria conectar se eu dissesse ao Postfix para usar localhost. 
+Se eu usar 127.0.0.1, o Postfix usa rede TCP para se conectar ao MySQL, o que não é problema mesmo em uma jaula chroot (a alternativa seria mover o soquete MySQL para 
+a jaula chroot, o que causa alguns outros problemas).
+
+Please make sure that /etc/mysql/my.cnf contains the following line:
+
+vi /etc/mysql/my.cnf
+
+[...]
+# Instead of skip-networking the default is now to listen only on
+# localhost which is more compatible and is not less secure.
+bind-address           = 127.0.0.1
+[...]
+If you had to modify /etc/mysql/my.cnf, please restart MySQL now:
+
+/etc/init.d/mysql restart
+Run
+
+netstat -tap | grep mysql
+to make sure that MySQL is listening on 127.0.0.1 (localhost.localdomain):
+
+root@server1:/usr/src# netstat -tap | grep mysql
+tcp        0      0 localhost.localdo:mysql *:*                     LISTEN      3895/mysqld
+root@server1:/usr/src#
+
+Now let's create our six text files.
+
+vi /etc/postfix/mysql-virtual_domains.cf
+user = mail_admin
+password = mail_admin_password
+dbname = mail
+query = SELECT domain AS virtual FROM domains WHERE domain='%s'
+hosts = 127.0.0.1
+vi /etc/postfix/mysql-virtual_forwardings.cf
+user = mail_admin
+password = mail_admin_password
+dbname = mail
+query = SELECT destination FROM forwardings WHERE source='%s'
+hosts = 127.0.0.1
+vi /etc/postfix/mysql-virtual_mailboxes.cf
+user = mail_admin
+password = mail_admin_password
+dbname = mail
+query = SELECT CONCAT(SUBSTRING_INDEX(email,'@',-1),'/',SUBSTRING_INDEX(email,'@',1),'/') FROM users WHERE email='%s'
+hosts = 127.0.0.1
+vi /etc/postfix/mysql-virtual_email2email.cf
+user = mail_admin
+password = mail_admin_password
+dbname = mail
+query = SELECT email FROM users WHERE email='%s'
+hosts = 127.0.0.1
+vi /etc/postfix/mysql-virtual_transports.cf
+user = mail_admin
+password = mail_admin_password
+dbname = mail
+query = SELECT transport FROM transport WHERE domain='%s'
+hosts = 127.0.0.1
+vi /etc/postfix/mysql-virtual_mailbox_limit_maps.cf
+user = mail_admin
+password = mail_admin_password
+dbname = mail
+query = SELECT quota FROM users WHERE email='%s'
+hosts = 127.0.0.1
+Then change the permissions and the group of these files:
+
+chmod o= /etc/postfix/mysql-virtual_*.cf
+chgrp postfix /etc/postfix/mysql-virtual_*.cf
+Now we create a user and group called vmail with the home directory /home/vmail. This is where all mail boxes will be stored.
+
+groupadd -g 5000 vmail
+useradd -g vmail -u 5000 vmail -d /home/vmail -m
+Next we do some Postfix configuration. Go sure that you replace server1.example.com with a valid FQDN, otherwise your Postfix might not work properly!
+
+postconf -e 'myhostname = server1.example.com'
+postconf -e 'mydestination = server1.example.com, localhost, localhost.localdomain'
+postconf -e 'mynetworks = 127.0.0.0/8'
+postconf -e 'virtual_alias_domains ='
+postconf -e 'virtual_alias_maps = proxy:mysql:/etc/postfix/mysql-virtual_forwardings.cf, mysql:/etc/postfix/mysql-virtual_email2email.cf'
+postconf -e 'virtual_mailbox_domains = proxy:mysql:/etc/postfix/mysql-virtual_domains.cf'
+postconf -e 'virtual_mailbox_maps = proxy:mysql:/etc/postfix/mysql-virtual_mailboxes.cf'
+postconf -e 'virtual_mailbox_base = /home/vmail'
+postconf -e 'virtual_uid_maps = static:5000'
+postconf -e 'virtual_gid_maps = static:5000'
+postconf -e 'smtpd_sasl_auth_enable = yes'
+postconf -e 'broken_sasl_auth_clients = yes'
+postconf -e 'smtpd_sasl_authenticated_header = yes'
+postconf -e 'smtpd_recipient_restrictions = permit_mynetworks, permit_sasl_authenticated, reject_unauth_destination'
+postconf -e 'smtpd_use_tls = yes'
+postconf -e 'smtpd_tls_cert_file = /etc/postfix/smtpd.cert'
+postconf -e 'smtpd_tls_key_file = /etc/postfix/smtpd.key'
+postconf -e 'transport_maps = proxy:mysql:/etc/postfix/mysql-virtual_transports.cf'
+postconf -e 'virtual_maildir_extended = yes'
+postconf -e 'virtual_mailbox_limit_maps = proxy:mysql:/etc/postfix/mysql-virtual_mailbox_limit_maps.cf'
+postconf -e 'virtual_mailbox_limit_override = yes'
+postconf -e 'virtual_maildir_limit_message = "The user you are trying to reach is over quota."'
+postconf -e 'virtual_overquota_bounce = yes'
+postconf -e 'proxy_read_maps = $local_recipient_maps $mydestination $virtual_alias_maps $virtual_alias_domains $virtual_mailbox_maps $virtual_mailbox_domains $relay_recipient_maps $relay_domains $canonical_maps $sender_canonical_maps $recipient_canonical_maps $relocated_maps $transport_maps $mynetworks $virtual_mailbox_limit_maps'
+
+Afterwards we create the SSL certificate that is needed for TLS:
+
+cd /etc/postfix
+openssl req -new -outform PEM -out smtpd.cert -newkey rsa:2048 -nodes -keyout smtpd.key -keyform PEM -days 365 -x509
+Country Name (2 letter code) [AU]: <-- Enter your Country Name (e.g., "DE").
+State or Province Name (full name) [Some-State]:<-- Enter your State or Province Name.
+Locality Name (eg, city) []:<-- Enter your City.
+Organization Name (eg, company) [Internet Widgits Pty Ltd]:<-- Enter your Organization Name (e.g., the name of your company).
+Organizational Unit Name (eg, section) []:<-- Enter your Organizational Unit Name (e.g. "IT Department").
+Common Name (eg, YOUR name) []:<-- Enter the Fully Qualified Domain Name of the system (e.g. "server1.example.com").
+Email Address []:<-- Enter your Email Address.
+
+Then change the permissions of the smtpd.key:
+
+chmod o= /etc/postfix/smtpd.key
+ 
+
+6 Configure Saslauthd
+First run
+
+mkdir -p /var/spool/postfix/var/run/saslauthd
+Then edit /etc/default/saslauthd. Set START to yes and change the line OPTIONS="-c -m /var/run/saslauthd" to OPTIONS="-c -m /var/spool/postfix/var/run/saslauthd -r":
+
+
+vi /etc/default/saslauthd
+#
+# Settings for saslauthd daemon
+# Please read /usr/share/doc/sasl2-bin/README.Debian for details.
+#
+
+# Should saslauthd run automatically on startup? (default: no)
+START=yes
+
+# Description of this saslauthd instance. Recommended.
+# (suggestion: SASL Authentication Daemon)
+DESC="SASL Authentication Daemon"
+
+# Short name of this saslauthd instance. Strongly recommended.
+# (suggestion: saslauthd)
+NAME="saslauthd"
+
+# Which authentication mechanisms should saslauthd use? (default: pam)
+#
+# Available options in this Debian package:
+# getpwent  -- use the getpwent() library function
+# kerberos5 -- use Kerberos 5
+# pam       -- use PAM
+# rimap     -- use a remote IMAP server
+# shadow    -- use the local shadow password file
+# sasldb    -- use the local sasldb database file
+# ldap      -- use LDAP (configuration is in /etc/saslauthd.conf)
+#
+# Only one option may be used at a time. See the saslauthd man page
+# for more information.
+#
+# Example: MECHANISMS="pam"
+MECHANISMS="pam"
+
+# Additional options for this mechanism. (default: none)
+# See the saslauthd man page for information about mech-specific options.
+MECH_OPTIONS=""
+
+# How many saslauthd processes should we run? (default: 5)
+# A value of 0 will fork a new process for each connection.
+THREADS=5
+
+# Other options (default: -c -m /var/run/saslauthd)
+# Note: You MUST specify the -m option or saslauthd won't run!
+#
+# WARNING: DO NOT SPECIFY THE -d OPTION.
+# The -d option will cause saslauthd to run in the foreground instead of as
+# a daemon. This will PREVENT YOUR SYSTEM FROM BOOTING PROPERLY. If you wish
+# to run saslauthd in debug mode, please run it by hand to be safe.
+#
+# See /usr/share/doc/sasl2-bin/README.Debian for Debian-specific information.
+# See the saslauthd man page and the output of 'saslauthd -h' for general
+# information about these options.
+#
+# Example for chroot Postfix users: "-c -m /var/spool/postfix/var/run/saslauthd"
+# Example for non-chroot Postfix users: "-c -m /var/run/saslauthd"
+#
+# To know if your Postfix is running chroot, check /etc/postfix/master.cf.
+# If it has the line "smtp inet n - y - - smtpd" or "smtp inet n - - - - smtpd"
+# then your Postfix is running in a chroot.
+# If it has the line "smtp inet n - n - - smtpd" then your Postfix is NOT
+# running in a chroot.
+#OPTIONS="-c -m /var/run/saslauthd"
+OPTIONS="-c -m /var/spool/postfix/var/run/saslauthd -r"
+Then create the file /etc/pam.d/smtp. It should contain only the following two lines (go sure to fill in your correct database details):
+
+vi /etc/pam.d/smtp
+auth    required   pam_mysql.so user=mail_admin passwd=mail_admin_password host=127.0.0.1 db=mail table=users usercolumn=email passwdcolumn=password crypt=1
+account sufficient pam_mysql.so user=mail_admin passwd=mail_admin_password host=127.0.0.1 db=mail table=users usercolumn=email passwdcolumn=password crypt=1
+Next create the file /etc/postfix/sasl/smtpd.conf. It should look like this:
+
+vi /etc/postfix/sasl/smtpd.conf
+pwcheck_method: saslauthd
+mech_list: plain login
+allow_plaintext: true
+auxprop_plugin: sql
+sql_engine: mysql
+sql_hostnames: 127.0.0.1
+sql_user: mail_admin
+sql_passwd: mail_admin_password
+sql_database: mail
+sql_select: select password from users where email = '%u@%r'
+Next add the postfix user to the sasl group (this makes sure that Postfix has the permission to access saslauthd):
+
+adduser postfix sasl
+Then restart Postfix and Saslauthd:
+
+/etc/init.d/postfix restart
+/etc/init.d/saslauthd restart
+
+7 Configure Courier
+Now we have to tell Courier that it should authenticate against our MySQL database. First, edit /etc/courier/authdaemonrc and change the value of authmodulelist so that it reads:
+
+vi /etc/courier/authdaemonrc
+[...]
+authmodulelist="authmysql"
+[...]
+Then make a backup of /etc/courier/authmysqlrc and empty the old file:
+
+cp /etc/courier/authmysqlrc /etc/courier/authmysqlrc_orig
+cat /dev/null > /etc/courier/authmysqlrc
+Then open /etc/courier/authmysqlrc and put the following lines into it:
+
+vi /etc/courier/authmysqlrc
+MYSQL_SERVER localhost
+MYSQL_USERNAME mail_admin
+MYSQL_PASSWORD mail_admin_password
+MYSQL_PORT 0
+MYSQL_DATABASE mail
+MYSQL_USER_TABLE users
+MYSQL_CRYPT_PWFIELD password
+#MYSQL_CLEAR_PWFIELD password
+MYSQL_UID_FIELD 5000
+MYSQL_GID_FIELD 5000
+MYSQL_LOGIN_FIELD email
+MYSQL_HOME_FIELD "/home/vmail"
+MYSQL_MAILDIR_FIELD CONCAT(SUBSTRING_INDEX(email,'@',-1),'/',SUBSTRING_INDEX(email,'@',1),'/')
+#MYSQL_NAME_FIELD
+MYSQL_QUOTA_FIELD quota
+During the installation, the SSL certificates for IMAP-SSL and POP3-SSL are created with the hostname localhost. To change this to the correct hostname (server1.example.com in this tutorial), delete the certificates...
+
+cd /etc/courier
+rm -f /etc/courier/imapd.pem
+rm -f /etc/courier/pop3d.pem
+... and modify the following two files; replace CN=localhost with CN=server1.example.com (you can also modify the other values, if necessary):
+
+
+vi /etc/courier/imapd.cnf
+[...]
+CN=server1.example.com
+[...]
+vi /etc/courier/pop3d.cnf
+[...]
+CN=server1.example.com
+[...]
+Then recreate the certificates...
+
+mkimapdcert
+mkpop3dcert
+... and restart Courier:
+
+/etc/init.d/courier-authdaemon restart
+/etc/init.d/courier-imap restart
+/etc/init.d/courier-imap-ssl restart
+/etc/init.d/courier-pop restart
+/etc/init.d/courier-pop-ssl restart
+By running
+
+telnet localhost pop3
+you can see if your POP3 server is working correctly. It should give back +OK Hello there. (Type quit to get back to the Linux shell.)
+
+root@server1:/etc/courier# telnet localhost pop3
+Trying 127.0.0.1...
+Connected to localhost.localdomain.
+Escape character is '^]'.
++OK Hello there.
+<-- quit
++OK Better luck next time.
+Connection closed by foreign host.
+root@server1:/etc/courier#
+
+ 
+
+8 Modify /etc/aliases
+Now we should open /etc/aliases. Make sure that postmaster points to root and root to your own username or your email address, e.g. like this:
+
+vi /etc/aliases
+[...]
+postmaster: root
+root: postmaster@yourdomain.tld
+[...]
+or like this (if administrator is your own username):
+
+[...]
+postmaster: root
+root:   administrator
+[...]
+Whenever you modify /etc/aliases, you must run
+
+newaliases
+afterwards and restart Postfix:	
+
+/etc/init.d/postfix restart
+
+
+
+
+
+
+
+
