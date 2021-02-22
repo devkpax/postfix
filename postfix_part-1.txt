@@ -1,0 +1,150 @@
+This document describes how to install a Postfix mail server that is based on virtual users and domains, i.e. users and domains that are in a MySQL database. I'll also demonstrate the installation and configuration of Courier (Courier-POP3, Courier-IMAP), so that Courier can authenticate against the same MySQL database Postfix uses.
+
+The resulting Postfix server is capable of SMTP-AUTH and TLS and quota (quota is not built into Postfix by default, I'll show how to patch your Postfix appropriately). Passwords are stored in encrypted form in the database (most documents I found were dealing with plain text passwords which is a security risk). In addition to that, this tutorial covers the installation of Amavisd, SpamAssassin and ClamAV so that emails will be scanned for spam and viruses. I will also show how to install SquirrelMail as a webmail interface so that users can read and send emails and change their passwords.
+
+The advantage of such a "virtual" setup (virtual users and domains in a MySQL database) is that it is far more performant than a setup that is based on "real" system users. With this virtual setup your mail server can handle thousands of domains and users. Besides, it is easier to administrate because you only have to deal with the MySQL database when you add new users/domains or edit existing ones. No more postmap commands to create db files, no more reloading of Postfix, etc. For the administration of the MySQL database you can use web based tools like phpMyAdmin which will also be installed in this howto. The third advantage is that users have an email address as user name (instead of a user name + an email address) which is easier to understand and keep in mind.
+
+This howto is meant as a practical guide; it does not cover the theoretical backgrounds. They are treated in a lot of other documents in the web.
+
+This document comes without warranty of any kind! I want to say that this is not the only way of setting up such a system. There are many ways of achieving this goal but this is the way I take. I do not issue any guarantee that this will work for you!
+
+This tutorial is based on Debian Wheezy, so you should set up a basic Debian Wheezy server installation before you continue with this tutorial. The system should have a static IP address. I use 192.168.0.100 as my IP address in this tutorial and server1.example.com as the hostname.
+
+It is very important that you make /bin/sh a symlink to /bin/bash...
+
+
+dpkg-reconfigure dash
+Use dash as the default system shell (/bin/sh)? <-- No
+
+... and that you disable AppArmor:
+
+/etc/init.d/apparmor stop 
+update-rc.d -f apparmor remove 
+apt-get remove apparmor apparmor-utils
+
+
+2 Install Postfix, Courier, Saslauthd, MySQL, phpMyAdmin
+To install Postfix, Courier, Saslauthd, MySQL, and phpMyAdmin, we simply run
+
+apt-get install postfix postfix-mysql postfix-doc mysql-client mysql-server courier-authdaemon courier-authlib-mysql courier-pop courier-pop-ssl courier-imap courier-imap-ssl libsasl2-2 libsasl2-modules libsasl2-modules-sql sasl2-bin libpam-mysql openssl phpmyadmin apache2 libapache2-mod-php5 php5 php5-mysql libpam-smbpass
+
+
+You will be asked a few questions:
+
+General type of mail configuration: <-- Internet Site
+System mail name: <-- server1.example.com
+New password for the MySQL "root" user: <-- yourrootsqlpassword
+Repeat password for the MySQL "root" user: <-- yourrootsqlpassword
+Create directories for web-based administration? <-- No
+SSL certificate required <-- Ok
+Web server to reconfigure automatically: <-- apache2
+Configure database for phpmyadmin with dbconfig-common? <-- No
+
+
+3 Apply The Quota Patch To Postfix
+We have to get the Postfix sources, patch it with the quota patch, build new Postfix .deb packages and install those .deb packages:
+
+apt-get build-dep postfix
+cd /usr/src
+apt-get source postfix
+(Make sure you use the correct Postfix version in the following commands. I have Postfix 2.9.6 installed. You can find out your Postfix version by running
+
+postconf -d | grep mail_version
+The output should look like this:
+
+root@server1:/usr/src# postconf -d | grep mail_version
+mail_version = 2.9.6
+milter_macro_v = $mail_name $mail_version
+root@server1:/usr/src#
+
+wget http://vda.sourceforge.net/VDA/postfix-vda-v11-2.9.6.patch
+cd postfix-2.9.6
+patch -p1 < ../postfix-vda-v11-2.9.6.patch
+
+Next open debian/rules and change DEB_BUILD_HARDENING from 1 to 0:
+
+vi debian/rules
+
+
+[...]
+export DEB_BUILD_HARDENING=0
+[...]
+
+dpkg-buildpackage
+
+
+cd ..
+
+
+ls -l
+
+
+Pick the postfix and postfix-mysql packages and install them like this:
+
+dpkg -i postfix_2.9.6-2_amd64.deb postfix-mysql_2.9.6-2_amd64.deb
+
+
+
+4 Create The MySQL Database For Postfix/Courier
+Now we create a database called mail:
+
+mysqladmin -u root -p create mail
+Next, we go to the MySQL shell:
+
+mysql -u root -p
+On the MySQL shell, we create the user mail_admin with the passwort mail_admin_password (replace it with your own password) who has SELECT,INSERT,UPDATE,DELETE privileges on the mail database. This user will be used by Postfix and Courier to connect to the mail database:
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON mail.* TO 'mail_admin'@'localhost' IDENTIFIED BY 'mail_admin_password';
+GRANT SELECT, INSERT, UPDATE, DELETE ON mail.* TO 'mail_admin'@'localhost.localdomain' IDENTIFIED BY 'mail_admin_password';
+FLUSH PRIVILEGES;
+Still on the MySQL shell, we create the tables needed by Postfix and Courier:
+
+USE mail;
+CREATE TABLE domains (
+domain varchar(50) NOT NULL,
+PRIMARY KEY (domain) )
+ENGINE=MyISAM;
+CREATE TABLE forwardings (
+source varchar(80) NOT NULL,
+destination TEXT NOT NULL,
+PRIMARY KEY (source) )
+ENGINE=MyISAM;
+CREATE TABLE users (
+email varchar(80) NOT NULL,
+password varchar(20) NOT NULL,
+quota INT(10) DEFAULT '10485760',
+PRIMARY KEY (email)
+) ENGINE=MyISAM;
+CREATE TABLE transport (
+domain varchar(128) NOT NULL default '',
+transport varchar(128) NOT NULL default '',
+UNIQUE KEY domain (domain)
+) ENGINE=MyISAM;
+quit;
+As you may have noticed, with the quit; command we have left the MySQL shell and are back on the Linux shell.
+
+The domains table will store each virtual domain that Postfix should receive emails for (e.g. example.com).
+
+domain
+example.com
+The forwardings table is for aliasing one email address to another, e.g. forward emails for info@example.com to sales@example.com.
+
+source	destination
+info@example.com	sales@example.com
+The users table stores all virtual users (i.e. email addresses, because the email address and user name is the same) and passwords (in encrypted form!) and a quota value for each mail box (in this example the default value is 10485760 bytes which means 10MB).
+Advertisement
+
+email	password	quota
+sales@example.com	No9.E4skNvGa. ("secret" in encrypted form)	10485760
+The transport table is optional, it is for advanced users. It allows to forward mails for single users, whole domains or all mails to another server. For example,
+
+domain	transport
+example.com	smtp:[1.2.3.4]
+would forward all emails for example.com via the smtp protocol to the server with the IP address 1.2.3.4 (the square brackets [] mean "do not make a lookup of the MX DNS record" (which makes sense for IP addresses...). If you use a fully qualified domain name (FQDN) instead you would not use the square brackets.).
+
+BTW, (I'm assuming that the IP address of your mail server system is 192.168.0.100) you can access phpMyAdmin over http://192.168.0.100/phpmyadmin/ in a browser and log in as mail_admin. Then you can have a look at the database. Later on you can use phpMyAdmin to administrate your mail server.
+
+
+
+	
+
